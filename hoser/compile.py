@@ -3,6 +3,8 @@ from distutils.log import error
 from enum import Enum
 from typing import Any, Callable, Optional, Sequence, Union
 from typing_extensions import Self
+import dill
+import dill.detect
 import os
 
 # Port types
@@ -20,23 +22,31 @@ class PortType(Enum):
             raise ValueError(f"expected only hoser types (hoser.Stream, hoser.Str, ...), found type {c}")
 
 class Port:
-    def __init__(self, name: str, typ: PortType) -> None:
+    def __init__(self, name: str, typ: PortType, dir: str) -> None:
         self.name = name
         self.typ = typ
+        self.dir = dir
 
 class Node:
     def __init__(self, name: str) -> None:
         self.name = name
         self.inports: dict[str, Port] = {}
         self.outports: dict[str, Port] = {}
+        self.pipe: Optional[Pipe] = None # set when node is added to a pipe
 
     def add_in(self, name: str, typ: PortType) -> Port:
-        self.inports[name] = Port(name, typ)
+        self.inports[name] = Port(name, typ, "in")
         return self.inports[name]
 
     def add_out(self, name: str, typ: PortType) -> Port:
-        self.outports[name] = Port(name, typ)
+        self.outports[name] = Port(name, typ, "out")
         return self.outports[name]
+
+
+class PortRef:
+    def __init__(self, node: Node, port: str) -> None:
+        self.node = node
+        self.port = port
 
 class Process(Node):
     def __init__(self, name: str, exe: str) -> None:
@@ -51,14 +61,25 @@ class Variable(Node):
         self.default = default
         self.add_in("i", typ)
         self.add_out("o", typ)
+        self.dir = None
 
     @property
-    def inport(self) -> Port:
-        return self.inports["i"]
+    def write(self) -> PortRef:
+        return PortRef(node=self, port="i")
 
     @property
-    def outport(self) -> Port:
-        return self.outports["o"]
+    def read(self) -> PortRef:
+        return PortRef(node=self, port="o")
+
+    def mark_sink(self):
+        if self.dir == "spout":
+            raise ValueError(f"variable {self.name} is already a spout, cannot also be a sink")
+        self.dir = "sink"
+
+    def mark_spout(self):
+        if self.dir == "sink":
+            raise ValueError(f"variable {self.name} is already a sink, cannot also be a spout")
+        self.dir = "spout"
 
 class Link:
     def __init__(self, fromproc: str, fromport: str, toproc: str, toport: str) -> None:
@@ -88,11 +109,9 @@ class Pipe:
             self.parent = _pipe_stack[-1]
             self.parent.children.append(self)
         _pipe_stack.append(self)
-        outs = self.root_fn(*args, **kwargs)
+        result = self.root_fn(*args, **kwargs)
         _pipe_stack.pop()
-        if not isinstance(outs, dict):
-            outs = {"stdout": outs}
-        return self.compile(**outs)
+        return result
 
     def proc(self, name: str) -> Node:
         if not isinstance(self.nodes[name], Process):
@@ -103,6 +122,7 @@ class Pipe:
         if node.name in self.nodes:
             raise ValueError(f"node with name '{node.name}' already exists in pipe")
         self.nodes[node.name] = node
+        node.pipe = self
         return node
 
     def add_process(self, name: str, exe: str) -> Process:
@@ -121,26 +141,12 @@ class Pipe:
         if srcType != dstType:
             raise ValueError(f"mismatched type between {src} -> {dst}, {srcType} != {dstType}")
 
-        self.links.append(Link(src.node.name, src.port, dst.node.name, dst.port))
+        if isinstance(src.node, Variable):
+            src.node.mark_spout()
+        if isinstance(dst.node, Variable):
+            dst.node.mark_sink()
 
-    def compile(self, **kwargs) -> Pipe:
-        for k, v in kwargs.items():
-            if isinstance(v, PortRef):
-                src = v.node.outports[v.port]
-                outVar = Variable(name=k, typ=src.typ)
-                self.connect(v, PortRef(outVar, "i"))
-            elif isinstance(v, list):
-                if len(v) > 0 and isinstance(v[0], PortRef):
-                    node = None
-                    for vi in v:
-                        src = vi.node.outports[vi.port]
-                        if node is None:
-                            node = Variable(name=k, typ=src.typ)
-                        self.connect(vi, PortRef(node, "i"))
-            else:
-                raise ValueError(f"got {v}, can only return hoser types from pipe (Stream, String, ...)")
-            
-        return self
+        self.links.append(Link(src.node.name, src.port, dst.node.name, dst.port))
 
     def all_children(self) -> list[Pipe]:
         found: dict[str, Pipe] = {}
@@ -159,19 +165,39 @@ class Pipe:
             found[child.name] = child
             child._resolve_children(found)
 
-# Tracked by context so that the code doesn't have to constantly pass pipe around
+# Tracked by context so that the code doesn't have to constantly pass pipe around. Default
+# pipe is returned if run in main program (outside of any hoser.pipe).
 _pipe_stack: list[Pipe] = []
+_default_pipe = Pipe(name="default")
 def _active_pipe() -> Pipe:
     if len(_pipe_stack) > 0:
         return _pipe_stack[-1]
-    raise RuntimeError("execing a command must be inside a pipe")
+    else:
+        return _default_pipe
+
+def default_pipe() -> Pipe:
+    return _default_pipe
+
+class variableMap:
+    def __getitem__(self, varname) -> Stream:
+        pipe = _active_pipe()
+        if varname in pipe.nodes:
+            return Stream(pipe.nodes[varname], "o")
+        return Stream(Variable(varname, PortType.STREAM), "o")
+
+    def __setitem__(self, varname, value) -> None:
+        pipe = _active_pipe()
+        if varname in pipe.nodes:
+            v = pipe.nodes[varname]
+        else:
+            v = pipe.add_node(Variable(varname, PortType.STREAM))
+        pipe.connect(value, PortRef(v, "i"))
+
+vars = variableMap()
 
 def pipe(fn: Callable) -> Callable:
     return Pipe(name=fn.__name__, root_fn=fn)
-
-def stdin() -> Stream:
-        """A variable representing the stdin of the program being run"""
-        return Stream(Variable("stdin", PortType.STREAM), "o")
+   
 
 def file(path: str = None, name: str = None) -> Stream:
     if name is None and path is not None:
@@ -189,11 +215,6 @@ def string(value: str, name=None) -> String:
     v = Variable(name, PortType.STRING, default=value)
     return String(v, "o")
 
-class PortRef:
-    def __init__(self, node: Node, port: str) -> None:
-        self.node = node
-        self.port = port
-
 class Stream(PortRef):
     def __init__(self, node: Node, port: str) -> None:
         super().__init__(node, port)
@@ -210,6 +231,17 @@ class Input:
 class Output:
     def __init__(self, name) -> None:
         self.name = name
+
+"""
+stdin refers to the stdin of the root hoser process that this pipeline is being run from
+"""
+stdin: Stream = Stream(node=Variable(name="stdin", typ=PortType.STREAM, default="stdin"), port="o")
+
+"""
+stdout will be written to the stdout of the root hoser process that this pipeline is being run for. If None,
+then stdout will not be written to at all (default).
+"""
+stdout: Optional[Stream] = None
 
 Returns = dict[str, Union[PortRef, list[PortRef]]]
 
@@ -262,3 +294,21 @@ def exec(exe: str,
         return result[0]
     else:
         return result
+
+"""
+A hoser function is a Python function that is serialized and packaged with the hos file to be
+executed in a Python environment on the host. It is syntactic sugar for wrapping a Python function with
+`python -c`.
+"""
+
+def fn(pyc: Callable) -> Callable:
+    def inner(*args, stdin: Stream = None, **kwargs) -> Optional[Stream]:
+        def _executor():
+            pyc(*args, **kwargs)
+        compiled = dill.dumps(_executor, byref=True, recurse=True)
+        return exec("python", stdin=stdin, name=f"py:{pyc.__name__}", args=["-c", f"""
+import dill
+fn = dill.loads({compiled})
+fn()
+"""])
+    return inner
