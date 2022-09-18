@@ -37,7 +37,7 @@ def run():
         with tempfile.NamedTemporaryFile() as tmp:
             tmp.write(compiled.encode("utf-8"))
             tmp.seek(0)
-            result = subprocess.run(["hoser"]+unknown+[tmp.name], stdin=sys.stdin, stderr=sys.stderr, stdout=sys.stdout)
+            result = subprocess.run(["hoser", "run"]+unknown+[tmp.name], stdin=sys.stdin, stderr=sys.stderr, stdout=sys.stdout)
             sys.exit(result.returncode)
 
 

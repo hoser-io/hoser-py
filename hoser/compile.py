@@ -207,12 +207,14 @@ def file(path: str = None, name: str = None) -> Stream:
     if path is not None:
         path = "file://"+path
     v = Variable(name, PortType.STREAM, default=path)
+    _active_pipe().add_node(v)
     return Stream(v, "o")
 
 def string(value: str, name=None) -> String:
     if name is None:
         name = "string"+str(next_instance("string"))
-    v = Variable(name, PortType.STRING, default=value)
+    v = Variable(name, PortType.STREAM, default=value)
+    _active_pipe().add_node(v)
     return String(v, "o")
 
 class Stream(PortRef):
@@ -241,7 +243,7 @@ stdin: Stream = Stream(node=Variable(name="stdin", typ=PortType.STREAM, default=
 stdout will be written to the stdout of the root hoser process that this pipeline is being run for. If None,
 then stdout will not be written to at all (default).
 """
-stdout: Optional[Stream] = None
+stdout: Optional[PortRef] = None
 
 Returns = dict[str, Union[PortRef, list[PortRef]]]
 
